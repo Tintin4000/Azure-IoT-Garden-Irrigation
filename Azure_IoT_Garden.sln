@@ -1,0 +1,43 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.29102.190
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AT328P_Garden_Sensor_SoilAir", "Sensors\AT328P_Garden_Sensor_SoilAir\AT328P_Garden_Sensor_SoilAir.vcxproj", "{0239B547-23AB-4639-91E5-407EBE57E79A}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ESP8266_Garden_Hub", "Hub\ESP8266_Garden_Hub\ESP8266_Garden_Hub.vcxproj", "{C5F80730-F44F-4478-BDAE-6634EFC2CA88}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MKR1000_Garden_Water_Control", "Control\MKR1000_Garden_Water_Control\MKR1000_Garden_Water_Control.vcxproj", "{C19FC5A6-736F-4568-8FDF-B49A42C19ABF}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AT32u4_Garden_Sensor_SoilAir", "Sensors\AT32u4_Garden_Sensor_SoilAir\AT32u4_Garden_Sensor_SoilAir.vcxproj", "{B70128AD-1B7E-47F3-89BC-D2F0CE341AD6}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x86 = Debug|x86
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{0239B547-23AB-4639-91E5-407EBE57E79A}.Debug|x86.ActiveCfg = Debug|Win32
+		{0239B547-23AB-4639-91E5-407EBE57E79A}.Debug|x86.Build.0 = Debug|Win32
+		{0239B547-23AB-4639-91E5-407EBE57E79A}.Release|x86.ActiveCfg = Release|Win32
+		{0239B547-23AB-4639-91E5-407EBE57E79A}.Release|x86.Build.0 = Release|Win32
+		{C5F80730-F44F-4478-BDAE-6634EFC2CA88}.Debug|x86.ActiveCfg = Debug|Win32
+		{C5F80730-F44F-4478-BDAE-6634EFC2CA88}.Debug|x86.Build.0 = Debug|Win32
+		{C5F80730-F44F-4478-BDAE-6634EFC2CA88}.Release|x86.ActiveCfg = Release|Win32
+		{C5F80730-F44F-4478-BDAE-6634EFC2CA88}.Release|x86.Build.0 = Release|Win32
+		{C19FC5A6-736F-4568-8FDF-B49A42C19ABF}.Debug|x86.ActiveCfg = Debug|Win32
+		{C19FC5A6-736F-4568-8FDF-B49A42C19ABF}.Debug|x86.Build.0 = Debug|Win32
+		{C19FC5A6-736F-4568-8FDF-B49A42C19ABF}.Release|x86.ActiveCfg = Release|Win32
+		{C19FC5A6-736F-4568-8FDF-B49A42C19ABF}.Release|x86.Build.0 = Release|Win32
+		{B70128AD-1B7E-47F3-89BC-D2F0CE341AD6}.Debug|x86.ActiveCfg = Debug|Win32
+		{B70128AD-1B7E-47F3-89BC-D2F0CE341AD6}.Debug|x86.Build.0 = Debug|Win32
+		{B70128AD-1B7E-47F3-89BC-D2F0CE341AD6}.Release|x86.ActiveCfg = Release|Win32
+		{B70128AD-1B7E-47F3-89BC-D2F0CE341AD6}.Release|x86.Build.0 = Release|Win32
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {E1307601-8291-484B-A07E-CA7A60D70BC8}
+	EndGlobalSection
+EndGlobal

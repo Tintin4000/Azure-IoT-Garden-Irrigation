@@ -43,9 +43,15 @@ const byte ERROR_BAD_CRC = 10;
 const byte ERROR_BAD_JSON = 11;
 
 // message reception time out in millisecond
-const uint16_t MSG_TIMEOUT = 3000;
+const uint16_t MSG_TIMEOUT = 2500;
 // message max size
-const uint8 MAX_BUFFER_SIZE = 150;
+const uint8 MAX_BUFFER_SIZE = 200;
+// CRC buffer max size
+const uint8 MAX_CRC_BUFFER_SIZE = 180;
+// JSON memory pool size, MUST be declared as a INT!
+const int MAX_JSON_SIZE = 300;
+// JSON memory pool for Azure IoTdevice TWIN, MUST be declared as a INT!
+const int MAX_JSON_TWIN_SIZE = 300;
 
 // retry attempt to connect to WiFi
 const int retryConnectWiFi = 25;
@@ -61,15 +67,16 @@ char devProps[156];
 bool deviceTwinUpdate = false;
 
 // serial message buffer
-char msgBuffer[156];
+char msgBuffer[MAX_BUFFER_SIZE];
 
 // the setup function runs once when you press reset or power the board
 void setup() {
 	// Get the Hardware Serial port started
 	Serial.begin(9600);
-	Serial1.begin(115200);
+	Serial1.begin(19200);
 #ifdef DEBUG_HUB  //Debug info
 	Serial1.setDebugOutput(true);
+	Serial1.printf("\nFree Heap Memory = %d.\n", ESP.getFreeHeap());
 #endif
 	// Set the pin HIGH for the HC-12 module to be in transmitter mode
 	pinMode(D1, OUTPUT);
@@ -293,32 +300,39 @@ void updateDeviceTwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsign
 #endif
 
 	// parse the properties
-	DynamicJsonBuffer jsonBuffer;
-	JsonObject &root = jsonBuffer.parseObject(temp);
+	StaticJsonDocument<MAX_JSON_TWIN_SIZE> jsonTwinDoc;
+	DeserializationError err = deserializeJson(jsonTwinDoc, temp);
+
 	// iterate the JSON device TWIN desired properties to discover device id
 	// depending on the situation the Json doc is not the same
+	JsonObject jsonRoot = jsonTwinDoc.as<JsonObject>();
+#ifdef DEBUG_HUB  //Debug info
+	Serial1.println("JSON property message is =>");
+	serializeJson(jsonRoot, Serial1);
+	Serial1.println();
+#endif	
+
 	// full update
-	if (root["desired"]["sensor"].success())
+	if (jsonRoot["desired"]["sensor"] != nullptr)
 	{
-		JsonObject &prop = root["desired"]["sensor"];
-		prop.printTo(devProps);
+		JsonObject sensorProp = jsonRoot["desired"]["sensor"];
+		serializeJson(sensorProp, devProps);
 		deviceTwinUpdate = true;
 	}
 	// partial update
-	else if (root["sensor"].success())
+	else if (jsonRoot["sensor"] != nullptr)
 	{
-		JsonObject &prop = root["sensor"];
-		prop.printTo(devProps);
+		JsonObject sensorProp = jsonRoot["sensor"];
+		serializeJson(sensorProp, devProps);
 		deviceTwinUpdate = true;
 	}
 
 #ifdef DEBUG_HUB  //Debug info
+	Serial1.printf("JSON property message status => %s\n", err.c_str());
 	Serial1.println(devProps);
-#endif
-	
+#endif	
 	// release memory
 	free(temp);
-	jsonBuffer.clear();
 }
 // END :: Adaptation of the Azure cloud-to-device SDK
 
@@ -332,15 +346,16 @@ void processMessage(const char* messageContent)
 }
 // END: Process message from the cloud
 
-// send the message to the cloud
-void sendSensorMessageToAzureIoTHub(JsonObject &jsonRoot) {
-	// add some parameters to the message
-	jsonRoot["location"] = "MainFrontGarden";
+// send the message to the Azure cloud
+void sendSensorMessageToAzureIoTHub(JsonDocument jsonDoc) {
 	char messageTime[25];
-	jsonRoot["sensordatetime"] = getFormattedTimeISO8601(messageTime, 25);
+	jsonDoc["sensordatetime"] = getFormattedTimeISO8601(messageTime, 25);
 	// send message to Azure
 	char sensorDataJson[255];
-	jsonRoot.printTo(sensorDataJson, 255);
+	serializeJson(jsonDoc, sensorDataJson, 255);
+#ifdef DEBUG_HUB  //Debug info
+	Serial1.printf("Json message send to Azure Cloud.\n%s\n", sensorDataJson);
+#endif
 	SendMessage(iothubClientHandle, sensorDataJson);
 	
 	IOTHUB_CLIENT_STATUS status;
@@ -404,21 +419,25 @@ char* getFormattedTimeISO8601(char* buffer, int buffsize)
 // process message from sensors.  Return true if message is succesfully decoded.
 byte processSerialMessage(const uint16 msglength, const char* payLoad)
 {
-	// Json message object buffer
-	StaticJsonBuffer<250> jsonBuffer;
-	// parse json message
-	JsonObject &jsonRoot = jsonBuffer.parseObject(payLoad);
+#ifdef DEBUG_HUB
+	//Debug info
+	Serial1.println("FUNC - processSerialMessage");
+#endif
 
-	// check the json structure
-	if (jsonRoot.success())
+	// Json message object buffer
+	StaticJsonDocument<MAX_JSON_SIZE> jsonSensorDoc;
+	// parse json message
+	DeserializationError err = deserializeJson(jsonSensorDoc, payLoad);
+
+	if (!err)
 	{
 		// check the checksum
-		uint32_t checksum = jsonRoot["CRC32"];
+		uint32_t checksum = jsonSensorDoc["CRC32"];
 		if (checksum) 
 		{
-			jsonRoot.remove("CRC32");
-			char crc32Buffer[128];
-			jsonRoot.printTo(crc32Buffer);
+			jsonSensorDoc.remove("CRC32");
+			char crc32Buffer[180];
+			serializeJson(jsonSensorDoc, crc32Buffer);
 			int bufLength = strlen(crc32Buffer);
 			uint32_t calcchecksum = CRC32::calculate(crc32Buffer, bufLength);
 			// flag CRC32 pass or fail
@@ -426,54 +445,87 @@ byte processSerialMessage(const uint16 msglength, const char* payLoad)
 			{
 #ifdef DEBUG_HUB
 				//Debug info
-				Serial1.printf("JSON message length = %u\n", jsonRoot.measureLength());
+				Serial1.printf("JSON sensor document message length = %u\n", measureJson(jsonSensorDoc) + 1);
+				Serial1.printf("JSON sensor document memory usage = %d.\n", jsonSensorDoc.memoryUsage());
+				Serial1.printf("JSON sensor document status = %s.\n", err.c_str());
 				Serial1.printf("Buffer length = %u\n", bufLength);
-				Serial1.printf("CRC32 incorrect. Checksum = %u, Calc checksum = %u\n%s\n", checksum, calcchecksum, payLoad);
+				Serial1.printf("CRC32 incorrect. Checksum = %u, Calc checksum = %u\n%s\n", checksum, calcchecksum, crc32Buffer);
 #endif
 				return ERROR_BAD_CRC;
 			}
+			else
+			{
+#ifdef DEBUG_HUB
+				//Debug info
+				Serial1.println("CRC32 correct.");
+#endif
+			}
+		}
+		else
+		{
+#ifdef DEBUG_HUB
+			//Debug info
+			Serial1.println("No CRC32 in JSON sensor document");
+#endif
+			return ERROR_BAD_CRC;
 		}
 	}
 	else
 	{
-#ifdef DEBUG_HUB  //Debug info
-		Serial1.printf("JSON message not correctly formated. => %s\n", payLoad);
-#endif	
+#ifdef DEBUG_HUB
+		//Debug info
+		Serial1.println("JSON sensor message not created.");
+		Serial1.printf("JSON sensor status = %s.\n", err.c_str());
+		Serial1.printf("JSON sensor memory usage = %d.\n", jsonSensorDoc.memoryUsage());
+#endif
 		return ERROR_BAD_JSON;
 	}
+#ifdef DEBUG_HUB  //Debug info
+	Serial1.printf("JSON sensor message length = %u\n", measureJson(jsonSensorDoc) + 1);
+	Serial1.printf("JSON sensor status = %s.\n", err.c_str());
+	Serial1.printf("JSON sensor memory usage = %d.\n", jsonSensorDoc.memoryUsage());
+#endif
 	return SUCCESS;
 }
 
-void SendCommand(const char devID)
+void SendCommand(char devID)
 {
-	DynamicJsonBuffer jsonBuffer;
-	JsonObject &root = jsonBuffer.parseObject(devProps);
+#ifdef DEBUG_HUB  //Debug info
+	Serial1.println("FUNC - SendCommand");
+#endif	
+	DynamicJsonDocument jsonTwinDoc(MAX_JSON_TWIN_SIZE);
+	deserializeJson(jsonTwinDoc, devProps);
 
-	for (auto kv : root) {
-		if ((strlen(kv.key) == 1) && (kv.key[0] == devID))
+	// Get a reference to the root object
+	JsonObject jsonRoot = jsonTwinDoc.as<JsonObject>();
+
+	for (JsonPair kv : jsonRoot) {
+		if ((strlen(kv.key().c_str()) == 1) && (kv.key().c_str()[0] == devID))
 		{
-			if (root[kv.key]["Sleep"].success())
+			int keySleep = jsonRoot[kv.key().c_str()]["Sleep"].as<int>();
+			if (keySleep != 0)
 			{
 				// send the command to change the interval
 				Serial.write(devID);
 				Serial.write(17);
 				// send the interval
-				Serial.print((const char*) root[kv.key]["Sleep"]);
+				Serial.print(keySleep);
 				Serial.write(10);
 #ifdef DEBUG_HUB  //Debug info
-				Serial1.printf("Send command to device: %d, Sleep = %s\n", devID, (const char*) root[kv.key]["Sleep"]);
+				Serial1.printf("Send command to device: %d, Sleep = %d\n", devID, keySleep);
 #endif	
 			}
-			if (root[kv.key]["Channel"].success())
+			int keyChannel = jsonRoot[kv.key().c_str()]["Channel"].as<int>();
+			if (keyChannel != 0)
 			{
 				// send the command to change the channel
 				Serial.write(devID);
 				Serial.write(18);
 				// send the channel
-				Serial.print((const char*) root[kv.key]["Channel"]);
+				Serial.print(keyChannel);
 				Serial.write(10);
 #ifdef DEBUG_HUB  //Debug info
-				Serial1.printf("Send command to device: %d, Channel = %s\n", devID, (const char*) root[kv.key]["Channel"]);
+				Serial1.printf("Send command to device: %d, Channel = %d\n", devID, keyChannel);
 #endif	
 			}
 		}
@@ -488,7 +540,7 @@ void loop() {
 	static byte inMessage = false, msgReady = false, myMessage = false;
 	static uint32_t msgStartTime;
 	static uint16 msgLength = 0;
-	static uint8_t devID, hubID;
+	static char devID, hubID;
 
 	// message time out
 	if (inMessage && ((millis() - msgStartTime) > MSG_TIMEOUT))
@@ -497,11 +549,10 @@ void loop() {
 		// send a NACK to the sensor
 		Serial.write(21);
 #ifdef DEBUG_HUB  //Debug info
-		Serial1.println();
-		Serial1.println("NACK, message time out.");
 		serialBuffer[buffpos] = 0;
 		Serial1.println(serialBuffer);
-#endif	
+		Serial1.println("NACK, message time out.");
+#endif
 	}
 
 	// process incoming serial bytes
@@ -546,12 +597,13 @@ void loop() {
 					hubID = serialBuffer[i];
 					i++;
 				}
-#ifdef DEBUG_HUB  //Debug info
-				Serial1.printf("Message length is %d, devID is %d, hubID is %d.", msgLength, devID, hubID);
-				Serial1.println();
-#endif
 				buffpos = 0;
+				serialBuffer[buffpos] = 0;
 				(hubID == myHubID) ? myMessage = true : myMessage = false;
+#ifdef DEBUG_HUB  //Debug info
+				Serial1.printf("Message length is %d, devID is %c, hubID is %c\n", msgLength, devID, hubID);
+				Serial1.printf("Message response time: %d ms.\n", millis() - msgStartTime);
+#endif
 			}
 			break;
 		case '\r':  //discard carriage return
@@ -585,7 +637,7 @@ void loop() {
 						Serial.write(10);
 						msgReady = true;
 #ifdef DEBUG_HUB  //Debug info
-						Serial1.printf("Send ACK to %c\n", devID);
+						Serial1.printf("Send ACK to device ID %c\n", devID);
 #endif	
 					}
 					else
@@ -595,7 +647,7 @@ void loop() {
 						Serial.write(21);
 						Serial.write(10);
 #ifdef DEBUG_HUB  //Debug info
-						Serial1.printf("NACK, message not correctly formated. Error %d", returnCode);
+						Serial1.printf("NACK, message not correctly formated. Error:%d\n", returnCode);
 						Serial1.println(serialBuffer);
 #endif	
 					}
@@ -634,20 +686,20 @@ void loop() {
 	{
 		msgReady = false;
 		// remove the checksum before sending to azure cloud
-		StaticJsonBuffer<250> jsonBuffer;
-		JsonObject &jsonRoot = jsonBuffer.parseObject(serialBuffer);
-		jsonRoot.remove("CRC32");
+		StaticJsonDocument<MAX_JSON_SIZE> jsonDoc;
+		deserializeJson(jsonDoc, serialBuffer);
+		jsonDoc.remove("CRC32");
 		// send the message to the Azure IoT Hub
 		unsigned long azureTimer = millis();
 		IoTHubClientStart();
-		sendSensorMessageToAzureIoTHub(jsonRoot);
+		sendSensorMessageToAzureIoTHub(jsonDoc);
 		IoTHubClient_LL_Destroy(iothubClientHandle);
 #ifdef DEBUG_HUB  //Debug info
 		Serial1.printf("Azure send message elapse : %d msec\n", millis() - azureTimer);
 #endif
 		//send the temperature and humidity to Blynk
-		float airTemp = atof(jsonRoot["AirTemp"]);
-		float airHum = atof(jsonRoot["AirHum"]);
+		float airTemp = atof(jsonDoc["AirTemp"]);
+		float airHum = atof(jsonDoc["AirHum"]);
 		Blynk.virtualWrite(V0, airTemp);
 		Blynk.virtualWrite(V1, airHum);
 	}

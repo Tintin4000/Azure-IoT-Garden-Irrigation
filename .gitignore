@@ -347,3 +347,35 @@ healthchecksdb
 
 # Backup folder for Package Reference Convert tool in Visual Studio 2017
 MigrationBackup/
+/Garden Sensor Bit Mask.xlsx
+/Documentation for Garden Irrigation Project.docx
+/Documentation for Garden Irrigation Project rev 0.3.docx
+/Documentation for Garden Irrigation Project rev 0.2.docx
+/connected with HOMEGATE.docx
+/Azure
+/Control/MKR1000_Garden_Water_Control
+/Hub/ESP8266_Garden_Hub/__vm
+/Hub/ESP8266_Garden_Hub/Token.h
+/Hub/ESP8266_Garden_Hub/SerialProcessing.c
+/Hub/ESP8266_Garden_Hub/Normal Operation.txt
+/Hub/ESP8266_Garden_Hub/NACK 3 Hub.txt
+/Hub/ESP8266_Garden_Hub/Log Message new Json lib.txt
+/Hub/ESP8266_Garden_Hub/log 13-06-2018.txt
+/Hub/ESP8266_Garden_Hub/ESP8266_Garden_Hub_2.ino
+/Hub/ESP8266_Garden_Hub/ESP8266_Garden_Hub.vcxproj.filters
+/Hub/ESP8266_Garden_Hub/ESP8266_Garden_Hub.vcxproj
+/Sensors/AT328P_Garden_Sensor_SoilAir
+/Sensors/AT32u4_Garden_Sensor_SoilAir/BoardTesting/src
+/Sensors/AT32u4_Garden_Sensor_SoilAir/BoardTesting/__vm
+/Sensors/AT32u4_Garden_Sensor_SoilAir/BoardTesting/BoardTesting.vcxproj.filters
+/Sensors/AT32u4_Garden_Sensor_SoilAir/BoardTesting/BoardTesting.vcxproj
+/Sensors/AT32u4_Garden_Sensor_SoilAir/BoardTesting/BoardTesting.sln
+/Sensors/AT32u4_Garden_Sensor_SoilAir/__vm
+/Sensors/AT32u4_Garden_Sensor_SoilAir/AT32u4_Garden_Sensor_SoilAir.vcxproj.filters
+/Sensors/AT32u4_Garden_Sensor_SoilAir/AT32u4_Garden_Sensor_SoilAir.vcxproj
+/Sensors/AT32u4_Garden_Sensor_SoilAir/Time out.txt
+/Sensors/AT32u4_Garden_Sensor_SoilAir/Reboot NACK.txt
+/Sensors/AT32u4_Garden_Sensor_SoilAir/NACK 3.txt
+/Sensors/AT32u4_Garden_Sensor_SoilAir/NACK 2.txt
+/Sensors/AT32u4_Garden_Sensor_SoilAir/NACK 1.txt
+/Sensors/AT32u4_Garden_Sensor_SoilAir/Log file.txt
