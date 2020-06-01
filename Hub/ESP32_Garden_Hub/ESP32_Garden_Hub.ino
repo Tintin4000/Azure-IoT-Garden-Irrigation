@@ -82,12 +82,14 @@ static QueueHandle_t qUartBuffer;
 static QueueHandle_t qJsonMessage;
 static QueueHandle_t qJsonAzure;
 static QueueHandle_t qFeedbackSensor;
+static QueueHandle_t qClearProperies;
 
 // Tasks used to clearly identify enclosed activities and share the load between core
 static TaskHandle_t tReceiveSerialSensorMsg = NULL;
 static TaskHandle_t tProcessSensorMsg = NULL;
 static TaskHandle_t tSendToAzure = NULL;
 static TaskHandle_t tFeedbackSensor = NULL;
+static TaskHandle_t tClearSensorProperties = NULL;
 
 // Flag the end of an Azure IoT transmission exchange
 volatile byte endOfAzureIoTEx = false;
@@ -126,12 +128,12 @@ void ReceiveSerialSensorMessageTask(void* pParam)
 
 	for (;;)
 	{
-		if (Serial1.available())
+		if (Serial2.available())
 		{
 #ifdef DEBUG_HUB  //Debug info
 			if (buffPos == 0) lStartTime = millis();
 #endif
-			uartinputchar = Serial1.read();
+			uartinputchar = Serial2.read();
 			// avoid to overflow the buffer
 			if (buffPos == (MAX_BUFFER_SIZE - 1))
 			{
@@ -279,7 +281,6 @@ void ProcessSensorMessageTask(void* pParam)
 									// adding the necessary properties for the Azure message
 									char messageTime[25];
 									jsonSensorDoc["sensordatetime"] = getFormattedTimeISO8601(messageTime, 25);
-									jsonSensorDoc["HubID"] = myHubID;
 									sensorFeedback[sensorID].sensorID = sensorID;
 									sensorFeedback[sensorID].acknowledge = 6;  // Ascii for ACK
 #ifdef DEBUG_HUB  //Debug info
@@ -361,8 +362,11 @@ void FeedbackSensorTask(void* pParam)
 				properties[SensorFeedbackFromQueue.property[i].property] = SensorFeedbackFromQueue.property[i].value;
 			}
 		}
-		serializeJson(jsonFeedback, Serial1);
-		Serial1.write(10);
+		serializeJson(jsonFeedback, Serial2);
+		Serial2.println();
+
+		// clear the properties after being sent
+		xQueueSendToBack(qClearProperies, &SensorFeedbackFromQueue.sensorID, 0);
 
 #ifdef DEBUG_HUB  //Debug info
 		Serial.printf("Send Ack (%u) to Sensor (%u).\n", SensorFeedbackFromQueue.acknowledge, SensorFeedbackFromQueue.sensorID);
@@ -371,6 +375,36 @@ void FeedbackSensorTask(void* pParam)
 #endif
 	}
 	vTaskDelete(NULL);
+}
+
+// Clear the sensor properties after being sent
+void ClearSensorProperties(void* pParam)
+{
+	const TickType_t xTicksToWait = pdMS_TO_TICKS(1);
+	uint8_t sensorID = 0;
+
+#ifdef DEBUG_HUB  //Debug info
+    Serial.printf("%s active on Core %d.\n", pcTaskGetTaskName(NULL), xPortGetCoreID());
+#endif
+
+    for (;;)
+    {
+		xQueueReceive(qClearProperies, &sensorID, portMAX_DELAY);
+
+		// clear the properties for the sensor
+		if (sensorID < MAX_SENSOR_ID)
+		{
+			// loop through the properties
+			for (uint8_t i = 0; i < MAX_SENSOR_PROPERTIES; i++)
+			{
+				sensorFeedback[sensorID].property[i].property[0] = '\0';
+				sensorFeedback[sensorID].property[i].value = 0;
+			}
+		}
+
+        //vTaskDelay(xTicksToWait);
+    }
+    vTaskDelete(NULL);
 }
 
 // Send the acknowledgement to the sensor
@@ -748,8 +782,8 @@ void updateDeviceTwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsign
 void processMessage(const char* messageContent)
 {
 #ifdef DEBUG_HUB  //Debug info
-	Serial1.print("Message from the Cloud : ");
-	Serial1.println(messageContent);
+	Serial2.print("Message from the Cloud : ");
+	Serial2.println(messageContent);
 #endif
 }
 
@@ -802,7 +836,7 @@ char* getFormattedTimeISO8601(char* buffer, int buffsize)
 void setup()
 {
 	Serial.begin(115200);
-	Serial1.begin(9600);
+	Serial2.begin(9600);
 	pinMode(21, OUTPUT);
 
 #ifdef DEBUG_HUB  //Debug info
@@ -847,6 +881,11 @@ void setup()
 		qFeedbackSensor = xQueueCreate(4, sizeof(sensorfeedback));
 		// create the task that send the acknowledgment to the sensor
 		xTaskCreatePinnedToCore(FeedbackSensorTask, "FeedbackSensorTask", 3000, NULL, 3, &tFeedbackSensor, 0);
+
+		// create the queue to hold the sensor id for which the properties have to be cleared
+		qClearProperies = xQueueCreate(2, 1);
+		// create the task that clear the properties
+		xTaskCreatePinnedToCore(ClearSensorProperties, "ClearSensorPropTask", 2000, NULL, 2, &tClearSensorProperties, 0);
 
 		// create the queue to hold the JSON message to send to the Azure Cloud
 		qJsonAzure = xQueueCreate(5, MAX_JSON_SIZE);
