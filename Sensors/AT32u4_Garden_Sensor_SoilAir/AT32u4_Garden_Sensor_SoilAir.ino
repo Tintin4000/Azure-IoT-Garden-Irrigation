@@ -42,7 +42,7 @@ SOFTWARE.
 #define HC12SETPIN A2
 
 // sensor ID
-constexpr uint8_t mySensorID = 2;
+constexpr uint8_t mySensorID = 1;
 // hub id
 constexpr char* myHubID = "ESP32HUB1";
 // location
@@ -61,8 +61,11 @@ enum sensorStatus
 };
 uint8_t sensorPreviousStatus = sensorStatus::OK;
 
-// number of Nack or nor response
+// number of Nack or no response
 uint8_t noResponse = 0;
+
+// last known HC-12 current with feedback
+uint16_t lastHC12Current = 0;
 
 // declare the class library for the SHT20 sensor
 DFRobot_SHT20 sht20;
@@ -78,7 +81,7 @@ constexpr uint8_t JSON_MSG = 245;
 // JSON feedback memeory pool size
 constexpr uint8_t JSON_FEEDBACK = 100;
 // acknowlegement time out
-constexpr uint16_t TIMEOUT_ACK = 3000;   // timeout in millis second after sending a message
+uint16_t lTimeOut = 2000;   // timeout in millis second after sending a message
 
 // Arg receive, transmit
 #ifdef DEBUG_HUB  //Debug info
@@ -98,7 +101,7 @@ void setup() {
 #endif
 	// Start the Serial hardware & software
 	Serial1.begin(9600);
-
+	   
 	// Set the HC-12 in transmitter mode
 	digitalWrite(RSTPIN, HIGH);
 	digitalWrite(HC12RST, HIGH);
@@ -234,6 +237,7 @@ void loop() {
 	static uint8_t recpos;
 	static size_t msgLength;
 	static bool startFeedback;
+	static uint16_t hc12Current;
 
 #ifdef DEBUG_HUB  //Debug info
 	if ((!sendStatus) || (sendStatus != prevsendStatus))
@@ -312,11 +316,24 @@ void loop() {
 		Serial1.println();
 		// reset status
 		sensorPreviousStatus = sensorStatus::OK;
-
+		// store the current used by the HC-12 to transmit
+		hc12Current = analogRead(HC12CUR) * 3;
 #ifdef DEBUG_HUB  //Debug info
 		softSerial.print("HC12 current = ");
-		softSerial.println(analogRead(HC12CUR) * 3);
+		softSerial.println(hc12Current);
 #endif
+		// test if the current used by the HC-12 has vary a lot, indicating that the module need a reset
+		if (hc12Current < (lastHC12Current / 2))
+		{
+			sensorPreviousStatus = sensorStatus::HC12ERROR;
+			digitalWrite(HC12RST, LOW);
+			delay(200);
+			digitalWrite(HC12RST, HIGH);
+#ifdef DEBUG_HUB  //Debug info
+			softSerial.print("HC12 current = ");
+			softSerial.println(analogRead(HC12CUR) * 3);
+#endif
+		}
 		// pending acknowledgment
 		sendStatus = 4;
 		startFeedback = false;
@@ -328,7 +345,7 @@ void loop() {
 	// once the message is send, wait for the acknowledgment or timeout
 	if (sendStatus == 4)
 	{
-		if ((millis() - counterMillis) < TIMEOUT_ACK) {
+		if ((millis() - counterMillis) < lTimeOut) {
 			while (Serial1.available())
 			{
 				// avoid to overrun the buffer size
@@ -336,11 +353,6 @@ void loop() {
 				{
 					// read and store in the buffer the serial character received on the serial port
 					rec = Serial1.read();
-//#ifdef DEBUG_HUB  //Debug info
-//					char temp[20];
-//					sprintf(temp, "Buffer=%u, pos=%u\n", rec, recpos);
-//					softSerial.print(temp);
-//#endif
 					// eliminate everything in the received buffer before the json message starts
 					if (!startFeedback)
 					{
@@ -382,6 +394,7 @@ void loop() {
 								{
 									sendStatus = 8;
 									send_retry = 0;
+									lastHC12Current = hc12Current;
 								}
 								// Nack received from hub
 								if (jsonFeedback["Ack"] == 21)
@@ -463,6 +476,7 @@ void loop() {
 		else
 		{
 			sendStatus = 2;
+			lTimeOut += random(1000);
 			if (send_retry >= MAX_RETRY)
 			{
 				sendStatus = 16;
@@ -476,7 +490,8 @@ void loop() {
 				sensorPreviousStatus = sensorStatus::BAD_TRANSMISSION;
 			}
 #ifdef DEBUG_HUB  //Debug info
-			softSerial.println("ACK time out.");
+			softSerial.print("ACK time out ");
+			softSerial.println(lTimeOut);
 #endif
 		}
 	}
