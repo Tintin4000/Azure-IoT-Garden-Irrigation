@@ -21,6 +21,11 @@
  SOFTWARE.
 */
 
+/*
+Configuration:
+The ESP32 DevKit uses the GPIO16 and 17 as the Serial1 and connected to the HC-12.
+The ESP32 Feather uses the GPIO16 and 17 as the Serial1 and connected to the HC - 12.
+*/
 
 #define ARDUINOJSON_ENABLE_STD_STREAM 0
 // #define DONT_USE_UPLOADTOBLOB
@@ -33,8 +38,9 @@
 #include "AzureIoTProtocol_MQTT.h"
 #include "iothubtransportmqtt.h"
 #include "Token.h"
+#include <FormatTime.h>
 
-#define DEBUG_HUB;
+#define DEBUG_SERIAL;
 
 // Garden hub id used by the sensor to identified the receiver
 constexpr char myHubID[] = "ESP32HUB1";
@@ -51,14 +57,15 @@ constexpr uint8_t MAX_BUFFER_SIZE = 250;
 constexpr uint8_t MAX_BUFFER_NOCRC_SIZE = MAX_BUFFER_SIZE - 18;
 // JSON memory pool size, MUST be declared as a INT!
 constexpr int MAX_JSON_SIZE = 400;
-constexpr int MAX_JSON_TWIN_SIZE = 350;
+constexpr int MAX_JSON_TWIN_SIZE = 250;  //350
 
 constexpr byte SUCCESS = 1;
 constexpr byte ERROR_BAD_CRC = 10;
 constexpr byte ERROR_BAD_JSON = 11;
 
-// NTP settings
-WiFiUDP ntpUDP;
+// Initialize the time format class
+FormatTime udpTime;
+
 
 // structure for the sensor property and method
 typedef struct {
@@ -83,13 +90,21 @@ static QueueHandle_t qJsonMessage;
 static QueueHandle_t qJsonAzure;
 static QueueHandle_t qFeedbackSensor;
 static QueueHandle_t qClearProperies;
+static QueueHandle_t qJsonDeviceTwin;
+
 
 // Tasks used to clearly identify enclosed activities and share the load between core
 static TaskHandle_t tReceiveSerialSensorMsg = NULL;
 static TaskHandle_t tProcessSensorMsg = NULL;
+static TaskHandle_t tSendToAzureWiFiReady = NULL;
 static TaskHandle_t tSendToAzure = NULL;
 static TaskHandle_t tFeedbackSensor = NULL;
 static TaskHandle_t tClearSensorProperties = NULL;
+static TaskHandle_t tProcessDevTwin = NULL;
+
+
+// Azure IoT Client handle - Device need to stay connected to receive direct method fom the Cloud
+//IOTHUB_CLIENT_LL_HANDLE iothubClientHandle;
 
 // Flag the end of an Azure IoT transmission exchange
 volatile byte endOfAzureIoTEx = false;
@@ -97,17 +112,38 @@ volatile byte endOfAzureIoTEx = false;
 // WiFi event
 void WiFiEvent(WiFiEvent_t event)
 {
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 	Serial.printf("[WiFi-event] event: %d - Connected: %d\n", event, WiFi.isConnected());
 #endif
 	if (event == SYSTEM_EVENT_STA_GOT_IP)
 	{
-		uint8_t item = true;
-		xQueueSendToBack(qHasIP, &item, 0);
-#ifdef DEBUG_HUB  //Debug info
-		Serial.print("IP address = ");
-		Serial.println(WiFi.localIP());
+		// using time routine to get the time from ntp, this is a must to have for the azureIot SDK to send message
+		uint8_t counter = 0;
+		time_t epochTime = 0;
+		configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
+		while ((epochTime == 0 || epochTime < 1000000) && counter < 100) {
+			counter++;
+			delay(2000);
+			epochTime = time(NULL);
+		}
+#ifdef DEBUG_SERIAL  //Debug info
+		Serial.print("MAC address : ");
+		Serial.println(WiFi.macAddress());
+		Serial.printf("Epoch = %u, counter = %u\n", epochTime, counter);
+		char dateTime[25];
+		udpTime.getFormattedTimeISO8601(dateTime, 25);
+		Serial.printf("GMT   = %s\n", dateTime);
+		udpTime.getFormattedTime(dateTime, 25);
+		Serial.printf("Local = %s\n", dateTime);
 #endif
+		// release Azure message upon WiFi connection
+		// Note: task creation should come before attempting to connect to WiFi
+		if (tSendToAzureWiFiReady != NULL) xTaskNotifyGive(tSendToAzureWiFiReady);
+
+	}
+	if (event == SYSTEM_EVENT_STA_DISCONNECTED)
+	{
+		WiFi.begin(mySSID, myPassword);
 	}
 }
 
@@ -122,18 +158,18 @@ void ReceiveSerialSensorMessageTask(void* pParam)
 
 	const TickType_t xTicksToWait = pdMS_TO_TICKS(1);
 
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 	Serial.printf("%s active on Core %d.\n", pcTaskGetTaskName(NULL), xPortGetCoreID());
 #endif
 
 	for (;;)
 	{
-		if (Serial2.available())
+		if (Serial1.available())
 		{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			if (buffPos == 0) lStartTime = millis();
 #endif
-			uartinputchar = Serial2.read();
+			uartinputchar = Serial1.read();
 			// avoid to overflow the buffer
 			if (buffPos == (MAX_BUFFER_SIZE - 1))
 			{
@@ -150,14 +186,15 @@ void ReceiveSerialSensorMessageTask(void* pParam)
 				if (uxQueueSpacesAvailable(qUartBuffer) == 0)
 				{
 					xQueueReset(qUartBuffer);
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 					Serial.println("The UART buffer queue is full.");
 #endif
 				}
 				xQueueSendToBack(qUartBuffer, serialBuffer, 0);
 
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 				Serial.printf("Message length = %d\n", buffPos);
+				Serial.println(serialBuffer);
 				Serial.printf("Serial response time: %d ms.\n", millis() - lStartTime);
 				Serial.printf("Available heap memory = %d\n", ESP.getFreeHeap());
 				Serial.printf("The minimum amount of remaining stack space is %u.\n", uxTaskGetStackHighWaterMark(NULL));
@@ -186,7 +223,7 @@ void ProcessSensorMessageTask(void* pParam)
 	uint32_t lStartTime;
 	char stringBuff[MAX_BUFFER_SIZE];
 
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 	Serial.printf("%s active on Core %d.\n", pcTaskGetTaskName(NULL), xPortGetCoreID());
 #endif
 
@@ -202,7 +239,7 @@ void ProcessSensorMessageTask(void* pParam)
 			// loop until the queue is empty
 			while (uxQueueMessagesWaiting(qUartBuffer))
 			{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 				Serial.printf("Processing 1 sensor message out of %d.\n", uxQueueMessagesWaiting(qUartBuffer));
 #endif
 				xQueueReceive(qUartBuffer, stringBuff, 0);
@@ -214,7 +251,7 @@ void ProcessSensorMessageTask(void* pParam)
 				// notify on incorrect formated Json
 				if (err)
 				{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 					Serial.printf("Incorrectly formated Json (%s).\n%s\n", err.c_str(), stringBuff);
 #endif
 				}
@@ -226,20 +263,20 @@ void ProcessSensorMessageTask(void* pParam)
 					// determine the sensor id used to store the feedback message
 					if (jsonSensorDoc["SensorID"].isNull())
 					{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 						Serial.println("The sensor message received do not contains a sensor id.");
 #endif
 					}
 					else
 					{
 						uint8_t sensorID = (uint8_t)jsonSensorDoc["SensorID"];
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 						Serial.printf("Correctly formated Json from sensor id %d.\n", sensorID);
 #endif
 
 						if (sensorID > MAX_SENSOR_ID)
 						{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 							Serial.printf("Sensor ID %u is bigger than the Sensor MAX value.\n", sensorID);
 #endif
 						}
@@ -252,7 +289,7 @@ void ProcessSensorMessageTask(void* pParam)
 								{
 									sensorFeedback[sensorID].sensorID = sensorID;
 									sensorFeedback[sensorID].acknowledge = 21;  // Ascii for NACK
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 									Serial.printf("No CRC32, sending NACK to %u.\n", sensorID);
 #endif
 									xQueueSendToBack(qFeedbackSensor, &sensorFeedback[sensorID], 0);
@@ -271,8 +308,8 @@ void ProcessSensorMessageTask(void* pParam)
 								{
 									sensorFeedback[sensorID].sensorID = sensorID;
 									sensorFeedback[sensorID].acknowledge = 21;  // Ascii for NACK
-#ifdef DEBUG_HUB  //Debug info
-									Serial.printf("Incorrect CRC32, buffer length is %u, received = %u and compute = %u, sending NACK to %u.\n", bufLength, checksum, calcchecksum ,sensorID);
+#ifdef DEBUG_SERIAL  //Debug info
+									Serial.printf("Incorrect CRC32, buffer length is %u, received = %u and compute = %u, sending NACK to %u.\n", bufLength, checksum, calcchecksum, sensorID);
 #endif
 									xQueueSendToBack(qFeedbackSensor, &sensorFeedback[sensorID], 0);
 								}
@@ -280,10 +317,11 @@ void ProcessSensorMessageTask(void* pParam)
 								{
 									// adding the necessary properties for the Azure message
 									char messageTime[25];
-									jsonSensorDoc["sensordatetime"] = getFormattedTimeISO8601(messageTime, 25);
+									udpTime.getFormattedTimeISO8601(messageTime, 25);
+									jsonSensorDoc["sensordatetime"] = messageTime;
 									sensorFeedback[sensorID].sensorID = sensorID;
 									sensorFeedback[sensorID].acknowledge = 6;  // Ascii for ACK
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 									Serial.printf("Correct CRC32, sending ACK to %u.\n", sensorID);
 #endif
 									xQueueSendToBack(qFeedbackSensor, &sensorFeedback[sensorID], 0);
@@ -295,19 +333,19 @@ void ProcessSensorMessageTask(void* pParam)
 										lCount = serializeJson(jsonSensorDoc, msgPayLoad);
 										if (lCount)
 										{
-											xQueueSendToBack(qJsonAzure, &msgPayLoad, 0);
-#ifdef DEBUG_HUB  //Debug info
+											xQueueSendToBack(qJsonAzure, msgPayLoad, 0);
+#ifdef DEBUG_SERIAL  //Debug info
 											Serial.printf("Serialized the JSON message succeed (%u)\n", lCount);
 #endif
 										}
 										else {
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 											Serial.println("Serialized the JSON message failed!");
 #endif
 										}
 									}
 									else {
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 										Serial.println("The buffer for the Azure JSON message is too small.");
 #endif
 									}
@@ -317,7 +355,7 @@ void ProcessSensorMessageTask(void* pParam)
 					}
 				}
 			}
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			Serial.printf("Message processing time: %d ms.\n", millis() - lStartTime);
 			Serial.printf("Available heap memory = %d\n", ESP.getFreeHeap());
 			Serial.printf("The minimum amount of remaining stack space for ProcessSensorMessageTask is %u.\n", uxTaskGetStackHighWaterMark(NULL));
@@ -332,7 +370,7 @@ void FeedbackSensorTask(void* pParam)
 {
 	const TickType_t xTicksToWait = pdMS_TO_TICKS(1);
 
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 	Serial.printf("%s active on Core %d.\n", pcTaskGetTaskName(NULL), xPortGetCoreID());
 #endif
 
@@ -362,13 +400,13 @@ void FeedbackSensorTask(void* pParam)
 				properties[SensorFeedbackFromQueue.property[i].property] = SensorFeedbackFromQueue.property[i].value;
 			}
 		}
-		serializeJson(jsonFeedback, Serial2);
-		Serial2.println();
+		serializeJson(jsonFeedback, Serial1);
+		Serial1.println();
 
 		// clear the properties after being sent
 		xQueueSendToBack(qClearProperies, &SensorFeedbackFromQueue.sensorID, 0);
 
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 		Serial.printf("Send Ack (%u) to Sensor (%u).\n", SensorFeedbackFromQueue.acknowledge, SensorFeedbackFromQueue.sensorID);
 		Serial.printf("Available heap memory = %d\n", ESP.getFreeHeap());
 		Serial.printf("The minimum amount of remaining stack space for FeedbackSensorTask is %u.\n", uxTaskGetStackHighWaterMark(NULL));
@@ -383,12 +421,12 @@ void ClearSensorProperties(void* pParam)
 	const TickType_t xTicksToWait = pdMS_TO_TICKS(1);
 	uint8_t sensorID = 0;
 
-#ifdef DEBUG_HUB  //Debug info
-    Serial.printf("%s active on Core %d.\n", pcTaskGetTaskName(NULL), xPortGetCoreID());
+#ifdef DEBUG_SERIAL  //Debug info
+	Serial.printf("%s active on Core %d.\n", pcTaskGetTaskName(NULL), xPortGetCoreID());
 #endif
 
-    for (;;)
-    {
+	for (;;)
+	{
 		xQueueReceive(qClearProperies, &sensorID, portMAX_DELAY);
 
 		// clear the properties for the sensor
@@ -401,10 +439,8 @@ void ClearSensorProperties(void* pParam)
 				sensorFeedback[sensorID].property[i].value = 0;
 			}
 		}
-
-        //vTaskDelay(xTicksToWait);
-    }
-    vTaskDelete(NULL);
+	}
+	vTaskDelete(NULL);
 }
 
 // Send the acknowledgement to the sensor
@@ -414,15 +450,39 @@ void SendToAzureTask(void* pParam)
 	IOTHUB_CLIENT_LL_HANDLE iothubClientHandle;
 	const TickType_t xTicksToWait = pdMS_TO_TICKS(10);
 
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 	Serial.printf("%s active on Core %d.\n", pcTaskGetTaskName(NULL), xPortGetCoreID());
 #endif
 
 	for (;;)
 	{
-		char msgPayLoad[MAX_JSON_SIZE];
+		char msgPayLoad[MAX_BUFFER_SIZE];
+		// wait for a message to be send
 		xQueueReceive(qJsonAzure, &msgPayLoad, portMAX_DELAY);
-#ifdef DEBUG_HUB  //Debug info
+
+		// test the WiFi before attempting to send the message to Azure
+		IPAddress ispIP;
+		if (WiFi.hostByName(myISP, ispIP) == 1)
+		{
+			xTaskNotifyGive(tSendToAzureWiFiReady);
+#ifdef DEBUG_SERIAL  //Debug info
+			Serial.print("Check internet OK, ISP IP = ");
+			Serial.println(ispIP);
+#endif
+		}
+		else
+		{
+#ifdef DEBUG_SERIAL  //Debug info
+			Serial.print("Internet check failed, ISP IP = ");
+			Serial.println(ispIP);
+#endif
+		}
+
+		// release the task if WiFi is connected
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+
+#ifdef DEBUG_SERIAL  //Debug info
 		lStartTime = millis();
 		Serial.println("Sending the JSON message to Azure IoT cloud.");
 		Serial.println(msgPayLoad);
@@ -455,10 +515,11 @@ void SendToAzureTask(void* pParam)
 
 			// Clean up the iothub sdk handle
 			IoTHubDeviceClient_LL_Destroy(iothubClientHandle);
+			iothubClientHandle = NULL;
 			// Free all the sdk subsystem
 			IoTHub_Deinit();
 		}
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 		Serial.printf("Azure processing time is %u ms, and DoWork count is %u.\n", millis() - lStartTime, count);
 		Serial.printf("Available heap memory = %u\n", ESP.getFreeHeap());
 		Serial.printf("The minimum amount of remaining stack space for SendToAzureTask is %u.\n", uxTaskGetStackHighWaterMark(NULL));
@@ -467,12 +528,77 @@ void SendToAzureTask(void* pParam)
 	vTaskDelete(NULL);
 }
 
+// Process the device TWIN message
+void ProcessDeviceTwinTask(void* pParam)
+{
+	const TickType_t xTicksToWait = pdMS_TO_TICKS(1);
+
+#ifdef DEBUG_SERIAL  //Debug info
+	Serial.printf("%s active on Core %d.\n", pcTaskGetTaskName(NULL), xPortGetCoreID());
+#endif
+
+	for (;;)
+	{
+		char msgPayLoad[MAX_JSON_TWIN_SIZE];
+		xQueueReceive(qJsonDeviceTwin, &msgPayLoad, portMAX_DELAY);
+#ifdef DEBUG_SERIAL  //Debug info
+		Serial.println("Processing Azure Device TWIN message.");
+#endif
+		// parse the properties
+		StaticJsonDocument<MAX_JSON_TWIN_SIZE> jsonTwinDoc;
+		DeserializationError err = deserializeJson(jsonTwinDoc, msgPayLoad);
+
+#ifdef DEBUG_SERIAL  //Debug info
+		Serial.printf("JSON property message status => %s\n", err.c_str());
+#endif	
+
+
+		// iterate the JSON device TWIN desired properties to add device properties to the storage
+		// example : {"desired":{"sensor":{"1":{"Channel":1,"Sleep":425}},"$version":4},"reported":{"$version":1}}
+		JsonObject jsonTwinRoot = jsonTwinDoc.as<JsonObject>();
+		if (jsonTwinRoot["desired"]["sensor"] != nullptr)
+		{
+			// locate the sensor section
+			JsonObject jsonSensors = jsonTwinRoot["desired"]["sensor"];
+			if (jsonSensors != NULL)
+			{
+				for (JsonPair kvSensor : jsonSensors)
+				{
+					// the TWIN device json message value is a text and need to be converted safely
+					uint16_t ulNode = std::strtoul(kvSensor.key().c_str(), NULL, 10);
+					if (ulNode && ulNode < MAX_SENSOR_ID)
+					{
+						JsonObject jsonSensor = jsonSensors[kvSensor.key().c_str()];
+						uint8_t i = 0;
+						for (JsonPair kvSensorProp : jsonSensor)
+						{
+							// max char array size for property is 10 and max number of property is 5
+							if ((strlen(kvSensorProp.key().c_str()) < 10) && (i < 5))
+							{
+								strcpy(sensorFeedback[ulNode].property[i].property, kvSensorProp.key().c_str());
+								sensorFeedback[ulNode].property[i].value = kvSensorProp.value().as<short>();
+								i++;
+							}
+						}
+					}
+				}
+			}
+		}
+#ifdef DEBUG_SERIAL  //Debug info
+		Serial.printf("Available heap memory = %d\n", ESP.getFreeHeap());
+		Serial.printf("The minimum amount of remaining stack space for ProcDevTwinTask is %u.\n", uxTaskGetStackHighWaterMark(NULL));
+#endif
+	}
+	vTaskDelete(NULL);
+}
+
+
 // Task description
 //void NameTask(void* pParam)
 //{
 //    const TickType_t xTicksToWait = pdMS_TO_TICKS(1);
 //
-//#ifdef DEBUG_HUB  //Debug info
+//#ifdef DEBUG_SERIAL  //Debug info
 //    Serial.printf("%s active on Core %d.\n", pcTaskGetTaskName(NULL), xPortGetCoreID());
 //#endif
 //
@@ -492,15 +618,16 @@ IOTHUB_CLIENT_LL_HANDLE IoTHubClientStart()
 	(void)IoTHub_Init();
 	// initialize the IoT Client using MQTT, syntax based on Microsoft Azure IoT Hub SDK
 	iothubClientHandle = IoTHubClient_LL_CreateFromConnectionString(myConnectionString, MQTT_Protocol);
+
 	if (iothubClientHandle == NULL) {
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 		Serial.println("Fail to connect to Azure IoT Hub!");
 #endif
 		return NULL;
 	}
 	else
 	{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 		Serial.println("Connected to Azure IoT Hub!");
 #endif
 		// Set any option that are neccessary.  For available options please see the iothub_sdk_options.md documentation in the main C SDK
@@ -510,7 +637,7 @@ IOTHUB_CLIENT_LL_HANDLE IoTHubClientStart()
 		int diag_off = 0;
 		IoTHubDeviceClient_LL_SetOption(iothubClientHandle, OPTION_DIAGNOSTIC_SAMPLING_PERCENTAGE, &diag_off);
 
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 		// turn on tracing for troubleshooting
 		bool traceOn = false;
 		IoTHubDeviceClient_LL_SetOption(iothubClientHandle, OPTION_LOG_TRACE, &traceOn);
@@ -525,13 +652,13 @@ IOTHUB_CLIENT_LL_HANDLE IoTHubClientStart()
 		// Setting connection status callback to get indication of connection to iothub
 		if (IoTHubDeviceClient_LL_SetConnectionStatusCallback(iothubClientHandle, ConnectionStatusCallback, NULL) != IOTHUB_CLIENT_OK)
 		{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			Serial.println("Azure IoTHub set connection status callback failed.");
 #endif
 		}
 		else
 		{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			Serial.println("Azure IoTHub set connection status callback succeeded.");
 #endif
 		}
@@ -539,26 +666,26 @@ IOTHUB_CLIENT_LL_HANDLE IoTHubClientStart()
 		// set the callback function when receiving messages from the cloud
 		if (IoTHubClient_LL_SetMessageCallback(iothubClientHandle, receiveMessageCallback, NULL) != IOTHUB_CLIENT_OK)
 		{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			Serial.println("Azure IoTHub set message callback failed.");
 #endif
 		}
 		else
 		{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			Serial.println("Azure IoTHub set message callback succeeded.");
 #endif
 		}
 		//set the callback function when receiving device twin update from the cloud
 		if (IoTHubClient_LL_SetDeviceTwinCallback(iothubClientHandle, updateDeviceTwinCallback, NULL) != IOTHUB_CLIENT_OK)
 		{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			Serial.println("Azure IoTHub device twin properties callback failed.");
 #endif
 		}
 		else
 		{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			Serial.println("Azure IoTHub device twin properties callback succeeded.");
 #endif
 		}
@@ -566,13 +693,13 @@ IOTHUB_CLIENT_LL_HANDLE IoTHubClientStart()
 
 		if (IoTHubDeviceClient_LL_SetDeviceMethodCallback(iothubClientHandle, deviceMethodCallback, NULL) != IOTHUB_CLIENT_OK)
 		{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			Serial.println("Azure IoTHub set Device Method callback failed.");
 #endif
 		}
 		else
 		{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			Serial.println("Azure IoTHub set Device Method callback succeeded.");
 #endif
 		}
@@ -587,7 +714,7 @@ void ConnectionStatusCallback(IOTHUB_CLIENT_CONNECTION_STATUS result, IOTHUB_CLI
 	(void)reason;
 	(void)user_context;
 
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 	if (result == IOTHUB_CLIENT_CONNECTION_AUTHENTICATED)
 	{
 		Serial.println("The device client is connected to iothub");
@@ -603,7 +730,7 @@ void ConnectionStatusCallback(IOTHUB_CLIENT_CONNECTION_STATUS result, IOTHUB_CLI
 void SendConfirmationCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void* userContextCallback)
 {
 	unsigned int messageTrackingId = (unsigned int)(uintptr_t)userContextCallback;
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 	Serial.printf("Message Id: %u Received.\n", messageTrackingId);
 	Serial.printf("Result is: %s\n", MU_ENUM_TO_STRING(IOTHUB_CLIENT_CONFIRMATION_RESULT, result));
 
@@ -633,7 +760,7 @@ IOTHUBMESSAGE_DISPOSITION_RESULT receiveMessageCallback(IOTHUB_MESSAGE_HANDLE me
 	{
 		messageId = "<null>";
 	}
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 	Serial.printf("Message ID: %s\n", messageId);
 #endif
 
@@ -642,14 +769,14 @@ IOTHUBMESSAGE_DISPOSITION_RESULT receiveMessageCallback(IOTHUB_MESSAGE_HANDLE me
 	{
 		correlationId = "<null>";
 	}
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 	Serial.printf("Correlation ID: %s\n", correlationId);
 #endif
 
 	// Message content
 	if (IoTHubMessage_GetByteArray(message, &buffer, &size) != IOTHUB_MESSAGE_OK)
 	{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 		Serial.println("Unable to retrieve the message content.");
 #endif
 		result = IOTHUBMESSAGE_REJECTED;
@@ -663,14 +790,14 @@ IOTHUBMESSAGE_DISPOSITION_RESULT receiveMessageCallback(IOTHUB_MESSAGE_HANDLE me
 
 		if (temp == NULL)
 		{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			Serial.println("Message is NULL.");
 #endif
 			result = IOTHUBMESSAGE_ABANDONED;
 		}
 		else
 		{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 			Serial.printf("Message from the Cloud : %s\n", temp);
 #endif
 			free(temp);
@@ -685,19 +812,19 @@ void SendMessage(IOTHUB_CLIENT_LL_HANDLE iothubClientHandle, const char* msgbuff
 	static unsigned int messageTrackingId;
 	IOTHUB_MESSAGE_HANDLE messageHandle = IoTHubMessage_CreateFromByteArray((const unsigned char*)msgbuffer, strlen(msgbuffer));
 	if (messageHandle == NULL) {
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 		Serial.println("Unable to create an IoT Message");
 #endif
 	}
 	if (IoTHubClient_LL_SendEventAsync(iothubClientHandle, messageHandle, SendConfirmationCallback, (void*)(uintptr_t)messageTrackingId) != IOTHUB_CLIENT_OK)
 	{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 		Serial.println("Failed to send the message to the IoT Hub.");
 #endif
 	}
 	else
 	{
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 		Serial.println("IoT Hub accepted the delivery of the message.");
 #endif
 		IoTHubMessage_Destroy(messageHandle);
@@ -717,7 +844,7 @@ int deviceMethodCallback(const char* method_name, const unsigned char* payload, 
 	(void)payload;
 	(void)size;
 
-	printf("Method Name: %s\n", method_name);
+	Serial.printf("Method Name: %s\n", method_name);
 }
 
 void updateDeviceTwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsigned char* payLoad, size_t size, void* userContextCallback)
@@ -727,48 +854,13 @@ void updateDeviceTwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsign
 	(void)memcpy(temp, payLoad, size);
 	temp[size] = '\0';
 
-#ifdef DEBUG_HUB  //Debug info
-	Serial.printf("TWIN Update is %s.\n", temp);
+#ifdef DEBUG_SERIAL  //Debug info
+	Serial.printf("TWIN Update is %s\n", temp);
+	Serial.printf("Available heap memory = %d\n", ESP.getFreeHeap());
 #endif
-	// parse the properties
-	StaticJsonDocument<MAX_JSON_TWIN_SIZE> jsonTwinDoc;
-	DeserializationError err = deserializeJson(jsonTwinDoc, temp);
 
-#ifdef DEBUG_HUB  //Debug info
-	Serial.printf("JSON property message status => %s\n", err.c_str());
-#endif	
-
-	// iterate the JSON device TWIN desired properties to add device properties to the storage
-	// example : {"desired":{"sensor":{"1":{"Channel":1,"Sleep":425}},"$version":4},"reported":{"$version":1}}
-	JsonObject jsonTwinRoot = jsonTwinDoc.as<JsonObject>();
-	if (jsonTwinRoot["desired"]["sensor"] != nullptr)
-	{
-		// locate the sensor section
-		JsonObject jsonSensors = jsonTwinRoot["desired"]["sensor"];
-		if (jsonSensors != NULL)
-		{
-			for (JsonPair kvSensor : jsonSensors)
-			{
-				// the TWIN device json message value is a text and need to be converted safely
-				uint16_t ulNode = std::strtoul(kvSensor.key().c_str(), NULL, 10);
-				if (ulNode && ulNode < MAX_SENSOR_ID)
-				{
-					JsonObject jsonSensor = jsonSensors[kvSensor.key().c_str()];
-					uint8_t i = 0;
-					for (JsonPair kvSensorProp : jsonSensor)
-					{
-						// max char array size for property is 10 and max number of property is 5
-						if ((strlen(kvSensorProp.key().c_str()) < 10) && (i < 5))
-						{
-							strcpy(sensorFeedback[ulNode].property[i].property, kvSensorProp.key().c_str());
-							sensorFeedback[ulNode].property[i].value = kvSensorProp.value().as<short>();
-							i++;
-						}
-					}
-				}
-			}
-		}
-	}
+	// queue the device TWIN message for processing
+	xQueueSendToBack(qJsonDeviceTwin, temp, 0);
 
 	// flag the transmission exchange to be complete
 	endOfAzureIoTEx = true;
@@ -781,125 +873,64 @@ void updateDeviceTwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsign
 // BEGIN: Process message from the cloud
 void processMessage(const char* messageContent)
 {
-#ifdef DEBUG_HUB  //Debug info
-	Serial2.print("Message from the Cloud : ");
-	Serial2.println(messageContent);
+#ifdef DEBUG_SERIAL  //Debug info
+	Serial1.print("Message from the Cloud : ");
+	Serial1.println(messageContent);
 #endif
 }
 
-// return time formatted like `hh:mm:ss`, requires 9 bytes
-char* getFormattedTime(char* buffer, uint8_t buffsize)
-{
-	if (buffsize >= 9) {
-		time_t rawtime;
-		struct tm* timeinfo;
-
-		time(&rawtime);
-		timeinfo = localtime(&rawtime);
-
-		strftime(buffer, buffsize, "%T", timeinfo);
-	}
-	return buffer;
-}
-
-// return time formatted like `dd-mm-yyyy hh:mm:ss`, requires 20 bytes
-char* getFullFormattedTime(char* buffer, int buffsize)
-{
-	if (buffsize >= 20) {
-		time_t rawtime;
-		struct tm* timeinfo;
-
-		time(&rawtime);
-		timeinfo = localtime(&rawtime);
-
-		strftime(buffer, buffsize, "%d-%m-%Y %T", timeinfo);
-	}
-	return buffer;
-}
-
-// return time formatted like `yyyy-mm-ddThh:mm:ssZ`, requires 25 bytes
-char* getFormattedTimeISO8601(char* buffer, int buffsize)
-{
-	if (buffsize >= 25) {
-		time_t rawtime;
-		struct tm* timeinfo;
-
-		time(&rawtime);
-		timeinfo = gmtime(&rawtime);
-
-		strftime(buffer, 25, "%FT%TZ", timeinfo);
-	}
-	return buffer;
-}
 
 // the setup function runs once when you press reset or power the board
 void setup()
 {
+#ifdef DEBUG_SERIAL  //Debug info
 	Serial.begin(115200);
-	Serial2.begin(9600);
+#endif
+	Serial1.begin(9600);
 	pinMode(21, OUTPUT);
 
-#ifdef DEBUG_HUB  //Debug info
+#ifdef DEBUG_SERIAL  //Debug info
 	WiFi.onEvent(WiFiEvent);
 	Serial.printf("\nInitializing on core %d\n", xPortGetCoreID());
 	Serial.printf("Total heap memory = %d\n", ESP.getHeapSize());
 	Serial.printf("Available heap memory = %d\n", ESP.getFreeHeap());
 #endif
 
+	// create the queue to hold the data from the sensor serial transmission
+	qUartBuffer = xQueueCreate(4, 250);
+	// create the task to queue serial sensor data
+	xTaskCreatePinnedToCore(ReceiveSerialSensorMessageTask, "RecSerialSensorMsgTask", 2500, NULL, 5, &tReceiveSerialSensorMsg, 0);
+
+	// create the queue to hold the JSON message from the sensor
+	qJsonMessage = xQueueCreate(4, 250);
+	// create the task to process the sensor message
+	xTaskCreatePinnedToCore(ProcessSensorMessageTask, "ProcSensorMsgTask", 4000, NULL, 2, &tProcessSensorMsg, 0);
+
+	// create the queue to hold the acknowledgment to the sensor
+	qFeedbackSensor = xQueueCreate(4, sizeof(sensorfeedback));
+	// create the task that send the acknowledgment to the sensor
+	xTaskCreatePinnedToCore(FeedbackSensorTask, "FeedbackSensorTask", 3000, NULL, 3, &tFeedbackSensor, 0);
+
+	// create the queue to hold the sensor id for which the properties have to be cleared
+	qClearProperies = xQueueCreate(2, 1);
+	// create the task that clear the properties
+	xTaskCreatePinnedToCore(ClearSensorProperties, "ClearSensorPropTask", 2000, NULL, 2, &tClearSensorProperties, 0);
+
+	// create the queue to hold the JSON message to send to the Azure Cloud
+	qJsonAzure = xQueueCreate(8, MAX_JSON_SIZE);
+	// create the task to send the JSON message to the Azure Cloud
+	xTaskCreatePinnedToCore(SendToAzureTask, "SendToAzureTask", 6000, NULL, 3, &tSendToAzure, 1);
+	if (tSendToAzure != NULL) tSendToAzureWiFiReady = tSendToAzure;
+
+	// create the queue to hold the TWIN JSON message from the Azure Cloud
+	qJsonDeviceTwin = xQueueCreate(8, MAX_JSON_TWIN_SIZE);
+	// create the task to send the JSON message to the Azure Cloud
+	xTaskCreatePinnedToCore(ProcessDeviceTwinTask, "ProcDevTwinTask", 4500, NULL, 1, &tProcessDevTwin, 1);
+
 	// set WiFi mode to Station only and enable event
 	WiFi.mode(WIFI_STA);
-	WiFi.begin();
 	WiFi.begin(mySSID, myPassword);
 
-	uint8_t item = true;
-	qHasIP = xQueueCreate(1, 1);
-	xQueueReceive(qHasIP, &item, (TickType_t)(10000 / portTICK_PERIOD_MS));
-
-	if (WiFi.isConnected())
-	{
-		// using time routine to get the time from ntp, this is a must to have for the azureIot SDK to send message
-		uint8_t counter = 0;
-		time_t epochTime = 0;
-		configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
-		while ((epochTime == 0 || epochTime < 1000000) && counter < 100) {
-			counter++;
-			delay(2000);
-			epochTime = time(NULL);
-		}
-
-		// create the queue to hold the data from the sensor serial transmission
-		qUartBuffer = xQueueCreate(4, 250);
-		// create the task to queue serial sensor data
-		xTaskCreatePinnedToCore(ReceiveSerialSensorMessageTask, "RecSerialSensorMsgTask", 2500, NULL, 5, &tReceiveSerialSensorMsg, 0);
-
-		// create the queue to hold the JSON message from the sensor
-		qJsonMessage = xQueueCreate(4, 250);
-		// create the task to process the sensor message
-		xTaskCreatePinnedToCore(ProcessSensorMessageTask, "ProcSensorMsgTask", 6000, NULL, 2, &tProcessSensorMsg, 0);
-
-		// create the queue to hold the acknowledgment to the sensor
-		qFeedbackSensor = xQueueCreate(4, sizeof(sensorfeedback));
-		// create the task that send the acknowledgment to the sensor
-		xTaskCreatePinnedToCore(FeedbackSensorTask, "FeedbackSensorTask", 3000, NULL, 3, &tFeedbackSensor, 0);
-
-		// create the queue to hold the sensor id for which the properties have to be cleared
-		qClearProperies = xQueueCreate(2, 1);
-		// create the task that clear the properties
-		xTaskCreatePinnedToCore(ClearSensorProperties, "ClearSensorPropTask", 2000, NULL, 2, &tClearSensorProperties, 0);
-
-		// create the queue to hold the JSON message to send to the Azure Cloud
-		qJsonAzure = xQueueCreate(5, MAX_JSON_SIZE);
-		// create the task to send the JSON message to the Azure Cloud
-		xTaskCreatePinnedToCore(SendToAzureTask, "SendToAzureTask", 6000, NULL, 1, &tSendToAzure, 1);
-
-#ifdef DEBUG_HUB  //Debug info
-		Serial.printf("Epoch = %u, counter = %u\n", epochTime, counter);
-		char dateTime[25];
-		Serial.printf("GMT   = %s\n", getFormattedTimeISO8601(dateTime, 25));
-		Serial.printf("Local = %s\n", getFormattedTime(dateTime, 25));
-#endif
-
-	}
 }
 
 // the loop function runs over and over again until power down or reset
